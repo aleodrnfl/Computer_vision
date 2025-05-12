@@ -5,21 +5,23 @@ import json
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 from models import ActionModel
 from sklearn.metrics import confusion_matrix, classification_report
+from ultralytics import YOLO
 
 # --- Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TEST_IMG_DIR = "CV_Test/Images"  # Path to test images
 TEST_LABEL_DIR = "CV_Test/Labels"  # Path to ground truth JSON labels
-DEFAULT_MODEL_PATH = "action_detection_model.pth"  # Default model path
-CHECKPOINT_DIR = "checkpoints"  # Directory containing checkpoint models
-OUTPUT_DIR = "test_outputs"
+DEFAULT_MODEL_PATH = "weights/best.pt"  # Default model path
+CHECKPOINT_DIR = "Computer_vision/checkpoints"  # Directory containing checkpoint models
+OUTPUT_DIR = "Computer_vision/test_outputs"
 NUM_CLASSES = 4  # standing, sitting, lying, throwing
-CLASS_NAMES = {0: "standing", 1: "sitting", 2: "lying", 3: "throwing"}
-CLASS_LIST = ["standing", "sitting", "lying", "throwing"]
+CLASS_NAMES = {0: "standing", 1: "lying", 2: "throwing", 3: "sitting"}
+CLASS_LIST = ["standing", "lying", "throwing", "sitting"]
+NUM_WORKERS = 4  # Number of workers for data loading
 
 # Image transformation should match what was used in training
 transform = transforms.Compose([
@@ -215,46 +217,89 @@ def list_available_checkpoints():
     return checkpoints
 
 
+def detect_and_classify_people(image_path, detector):
+    img = Image.open(image_path).convert("RGB")
+    results = detector(img)
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("arial.ttf", 18)
+    except:
+        font = ImageFont.load_default()
+    person_results = []
+    
+    for box in results[0].boxes:
+        # 소수점 유지하면서 좌표 추출
+        x1, y1, x2, y2 = box.xyxy[0].tolist()  # float 값 그대로 유지
+        cls = int(box.cls)
+        conf = float(box.conf)
+        label = CLASS_NAMES[cls]
+        
+        # 바운딩박스와 분류 결과 시각화 (시각화는 정수 좌표 사용)
+        draw.rectangle([int(x1), int(y1), int(x2), int(y2)], outline='green', width=3)
+        draw.text((int(x1), int(y1)-10), f"{label} ({conf:.2f})", fill='black', font=font)
+        person_results.append({
+            'bbox': [x1, y1, x2, y2],  # 소수점이 있는 원본 좌표 저장
+            'label': label,
+            'confidence': conf
+        })
+    return img, person_results
+
+
+def save_labelme_json(image_path, person_results, output_dir):
+    """YOLO 결과를 labelme 형식의 JSON으로 저장"""
+    # 이미지 정보 가져오기
+    img = Image.open(image_path)
+    width, height = img.size
+    
+    # labelme 형식의 JSON 구조 생성
+    labelme_data = {
+        "version": "5.8.1",
+        "flags": {},
+        "shapes": [],
+        "imagePath": os.path.basename(image_path),
+        "imageData": None,
+        "imageHeight": height,
+        "imageWidth": width
+    }
+    
+    # 각 감지된 객체에 대해 shape 정보 추가
+    for result in person_results:
+        x1, y1, x2, y2 = result['bbox']
+        shape = {
+            "label": result['label'],
+            "points": [
+                [x1, y1],
+                [x2, y2]
+            ],
+            "group_id": None,
+            "description": "",
+            "shape_type": "rectangle",
+            "flags": {},
+            "mask": None
+        }
+        labelme_data["shapes"].append(shape)
+    
+    # JSON 파일 저장
+    json_filename = os.path.splitext(os.path.basename(image_path))[0] + ".json"
+    json_path = os.path.join(output_dir, json_filename)
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(labelme_data, f, indent=4, ensure_ascii=False)
+    
+    return json_path
+
+
 def main():
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(
-        description="Evaluate action detection model")
+    parser = argparse.ArgumentParser(description="Evaluate YOLO model")
     parser.add_argument('--model', type=str, default=DEFAULT_MODEL_PATH,
-                        help=f'Path to model weights (default: {DEFAULT_MODEL_PATH})')
-    parser.add_argument('--best', action='store_true',
-                        help='Use best checkpoint model from training')
-    parser.add_argument('--list-checkpoints', action='store_true',
-                        help='List available checkpoint models')
+                        help='Path to YOLO model weights')
     parser.add_argument('--output', type=str, default=OUTPUT_DIR,
                         help=f'Directory to save results (default: {OUTPUT_DIR})')
-    parser.add_argument('--visualize-all', action='store_true',
-                        help='Create visualizations for all test images (otherwise limit to 20)')
+    parser.add_argument('--save-json', action='store_true',
+                        help='Save results in labelme JSON format')
     args = parser.parse_args()
 
-    # List checkpoints if requested
-    if args.list_checkpoints:
-        checkpoints = list_available_checkpoints()
-        if checkpoints:
-            print("Available checkpoint models:")
-            for i, ckpt in enumerate(checkpoints):
-                print(f"  [{i}] {ckpt}")
-        else:
-            print("No checkpoint models found")
-        return
-
-    # Determine which model to use
-    model_path = args.model
-    if args.best and os.path.exists(os.path.join(CHECKPOINT_DIR, "best_model.pth")):
-        model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
-        print(f"Using best model checkpoint: {model_path}")
-
     print(f"Using device: {DEVICE}")
-
-    # Check for ground truth labels
-    use_gt = os.path.isdir(TEST_LABEL_DIR)
-    if use_gt:
-        print(
-            f"Found ground-truth labels in {TEST_LABEL_DIR}, computing accuracy metrics")
 
     # Verify test images directory
     if not os.path.isdir(TEST_IMG_DIR):
@@ -270,79 +315,31 @@ def main():
 
     print(f"Found {len(test_images)} test images")
 
-    # Load model
-    model = load_model(model_path, NUM_CLASSES)
-    if model is None:
-        return
+    # Load YOLO model
+    detector = YOLO(args.model)
+
+    # Create output directories
+    vis_dir = os.path.join(args.output, 'visualizations')
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    if args.save_json:
+        json_dir = os.path.join(args.output, 'labels')
+        os.makedirs(json_dir, exist_ok=True)
 
     # Process all images
-    predictions = {}
-    all_gt_labels = []
-    all_pred_labels = []
-
     for img_name in test_images:
         img_path = os.path.join(TEST_IMG_DIR, img_name)
-        prediction = predict(model, img_path)
-
-        if prediction['label'] is None:
-            continue
-
-        print(
-            f"{img_name}: {prediction['label']} ({prediction['confidence']:.2%}, {prediction['time_ms']:.1f} ms)")
-
-        # Check ground truth if available
-        if use_gt:
-            json_name = os.path.splitext(img_name)[0] + ".json"
-            gt_path = os.path.join(TEST_LABEL_DIR, json_name)
-            if os.path.isfile(gt_path):
-                with open(gt_path, 'r') as jf:
-                    data = json.load(jf)
-                shapes = data.get('shapes', [])
-                if shapes:
-                    gt_label = shapes[0].get('label')
-                    prediction['gt_label'] = gt_label
-                    all_gt_labels.append(gt_label)
-                    all_pred_labels.append(prediction['label'])
-
-                    # Print ✓ or ✗ to indicate correct/incorrect
-                    correct = gt_label == prediction['label']
-                    print(
-                        f"  Ground truth: {gt_label} {'✓' if correct else '✗'}")
-            else:
-                print(f"  Warning: GT label file not found for {img_name}")
-
-        predictions[img_name] = prediction
-
-    # Calculate metrics
-    metrics = {'total': len(predictions)}
-
-    if use_gt and all_gt_labels:
-        # Only include images where we had ground truth
-        correct = sum(1 for gt, pred in zip(
-            all_gt_labels, all_pred_labels) if gt == pred)
-        accuracy = 100.0 * correct / len(all_gt_labels)
-
-        # Create confusion matrix and classification report
-        cm = confusion_matrix(
-            all_gt_labels, all_pred_labels, labels=CLASS_LIST)
-        report = classification_report(
-            all_gt_labels, all_pred_labels, labels=CLASS_LIST)
-
-        # Add to metrics
-        metrics.update({
-            'correct': correct,
-            'total_with_gt': len(all_gt_labels),
-            'accuracy': accuracy,
-            'confusion_matrix': cm,
-            'report': report
-        })
-
-        print(f"\nAccuracy: {correct}/{len(all_gt_labels)} = {accuracy:.2f}%")
-        print("\nClassification Report:")
-        print(report)
-
-    # Save results
-    save_results(predictions, metrics, args.output)
+        vis_img, person_results = detect_and_classify_people(img_path, detector)
+        
+        # 시각화 이미지 저장
+        vis_img.save(os.path.join(vis_dir, f"{os.path.splitext(img_name)[0]}_detected.png"))
+        
+        # JSON 파일 저장 (요청된 경우)
+        if args.save_json:
+            json_path = save_labelme_json(img_path, person_results, json_dir)
+            print(f"{img_name}: {len(person_results)}분류 완료, JSON 저장됨: {json_path}")
+        else:
+            print(f"{img_name}: {len(person_results)}분류 완료")
 
 
 if __name__ == '__main__':
